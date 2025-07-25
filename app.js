@@ -54,12 +54,12 @@ app.post("/api/loans", async (request, response) => {
   const { customer_id, loan_amount, loan_period, rate_of_interest } =
     request.body;
 
-  // First, validate that all required fields are present
+  // Validate that all required fields are present
   if (!customer_id || !loan_amount || !loan_period || !rate_of_interest) {
     return response.status(400).send({ error: "Missing required fields" });
   }
 
-  // Simple interest calculation as per the assignment
+  // Simple interest calculation
   const interest = loan_amount * loan_period * rate_of_interest;
   const totalAmount = loan_amount + interest;
   const monthlyEMI = Math.ceil(totalAmount / (loan_period * 12));
@@ -69,7 +69,8 @@ app.post("/api/loans", async (request, response) => {
         INSERT INTO "Loan" (customer_id, principal_amount, interest_rate, loan_period_years, total_amount_due, monthly_emi)
         VALUES (?, ?, ?, ?, ?, ?);
     `;
-  await db.run(addLoanQuery, [
+  // Get the result of the query, which contains the ID of the new row
+  const result = await db.run(addLoanQuery, [
     customer_id,
     loan_amount,
     rate_of_interest,
@@ -78,9 +79,11 @@ app.post("/api/loans", async (request, response) => {
     monthlyEMI,
   ]);
 
-  // Send back what the assignment asked for
-  response.send({
-    total_amount_to_be_paid: totalAmount,
+  // Send back the response including the new loan_id
+  response.status(201).send({
+    loan_id: result.lastID,
+    customer_id: customer_id,
+    total_amount_payable: totalAmount,
     monthly_emi: monthlyEMI,
   });
 });
@@ -92,7 +95,7 @@ app.post("/api/loans/:loan_id/payments", async (request, response) => {
 
   // First, record this payment in the transaction history
   const transactionQuery = `INSERT INTO "Transaction" (loan_id, amount, payment_date, payment_type) VALUES (?, ?, ?, ?);`;
-  await db.run(transactionQuery, [
+  const transactionResult = await db.run(transactionQuery, [
     loan_id,
     amount,
     new Date().toISOString(),
@@ -103,7 +106,23 @@ app.post("/api/loans/:loan_id/payments", async (request, response) => {
   const updateLoanQuery = `UPDATE "Loan" SET amount_paid = amount_paid + ? WHERE loan_id = ?;`;
   await db.run(updateLoanQuery, [amount, loan_id]);
 
-  response.send({ message: "Payment successful" });
+  // Now, get the updated loan details to calculate the new balance
+  const getLoanQuery = `SELECT * FROM "Loan" WHERE loan_id = ?;`;
+  const updatedLoan = await db.get(getLoanQuery, [loan_id]);
+
+  // Calculate the remaining balance and EMIs
+  const remainingBalance =
+    updatedLoan.total_amount_due - updatedLoan.amount_paid;
+  const emisLeft = Math.ceil(remainingBalance / updatedLoan.monthly_emi);
+
+  // Send back the detailed response as per the spec
+  response.send({
+    payment_id: transactionResult.lastID,
+    loan_id: loan_id,
+    message: "Payment recorded successfully.",
+    remaining_balance: remainingBalance,
+    emis_left: emisLeft,
+  });
 });
 
 // 3. LEDGER: Get the full history and status of one loan
@@ -144,14 +163,18 @@ app.get("/api/customers/:customer_id/overview", async (request, response) => {
   const getCustomerLoansQuery = `SELECT * FROM "Loan" WHERE customer_id = ?;`;
   const customerLoans = await db.all(getCustomerLoansQuery, [customer_id]);
 
+  // This part is important. If there are no loans, we don't error.
+  // We return the structure with an empty list, as the customer exists.
   if (!customerLoans.length) {
-    return response
-      .status(404)
-      .send({ error: "No loans found for this customer" });
+    return response.send({
+      customer_id: customer_id,
+      total_loans: 0,
+      loans: [],
+    });
   }
 
   // Loop through the loans and format the output for each one
-  const overview = customerLoans.map((loan) => {
+  const loansList = customerLoans.map((loan) => {
     const balance = loan.total_amount_due - loan.amount_paid;
     return {
       loan_id: loan.loan_id,
@@ -164,7 +187,12 @@ app.get("/api/customers/:customer_id/overview", async (request, response) => {
     };
   });
 
-  response.send(overview);
+  // Send the final object, formatted to match the spec
+  response.send({
+    customer_id: customer_id,
+    total_loans: loansList.length,
+    loans: loansList,
+  });
 });
 
 // --- Start the app ---
